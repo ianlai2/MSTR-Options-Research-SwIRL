@@ -1,0 +1,5 @@
+{
+  "input": "C:\\Users\\Saber\\Desktop\\research\\Dropbox\\SwIRL_GPU\\Stock Market Research\\Options_History\\TSLA_Options_Storage\\TSLA Options History.csv",
+  "output": "TSLA_Options_cleaned.parquet",
+  "parquet": true
+}

@@ -1,0 +1,9 @@
+{
+  "input": "TSLA_Options_cleaned.parquet",
+  "output": "TSLA_returns_distribution_fits.png",
+  "bins": 150,
+  "kde_bw": "ISJ",
+  "group_col": "Symbol",
+  "price_col": "Stock Price",
+  "quiet": false
+}
