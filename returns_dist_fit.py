@@ -1,463 +1,384 @@
-"""Options returns analysis with parametric and non-parametric distribution fitting.
+"""returns_dist_fit_v2
 
-Execution Flow:
-    1. Read dataframe (parquet/csv)
-    2. Calculate returns series grouped by symbol
-    3. Drop all missing values
-    4. Fit KDE (non-parametric) and Non-Central t (parametric) to returns
-    5. Output side-by-side comparison plots
+Pipeline (requested order):
+1. Ingest data & clean price column
+2. Calculate returns (drop NaNs)
+3. Fit KDE to returns series
+4. Find best continuous distribution (infinite support) using KS tests
+5. Generate side-by-side plot (best parametric vs KDE)
+6. Return best fit parametric distribution name & parameters + KS scan table
 
-Main Function:
-    analyze_returns_and_plot(df, output_path=None, bins=150, kde_bw='silverman',
-                             group_col='Symbol', price_col='Stock Price')
-        Complete pipeline from dataframe to side-by-side plots.
+Config/CLI parameters supported:
+- input: path to CSV/Parquet data
+- output: path for final image (CSV summaries derived from stem)
+- kde_bw: bandwidth method for FFTKDE (default ISJ)
+- ticker: filter DataFrame by ticker symbol (column default 'Tic')
+- start_date, end_date: inclusive date range filters (on date_col)
+- date_col: name of date column (default 'Date')
+- group_col: ticker column (default 'Tic')
+- price_col: price column (default 'Price')
+- distributions: comma separated list of scipy.stats distribution names (default: all infinite support continuous)
+- alpha: KS test significance threshold (default 0.01)
+- quiet: suppress verbose output
 
-Core Functions:
-    calculate_returns(df, group_col, price_col) -> pd.DataFrame
-        Add lagged price and returns columns.
-    
-    parametric_fit(data) -> dict
-        Fit non-central t-distribution, return parameters.
-    
-    nonparametric_fit(data, bw) -> tuple
-        Fit KDE, return (support, density).
-    
-    plot_side_by_side_fits(data, nct_params, kde_support, kde_density, bins, output_path)
-        Create side-by-side comparison plot.
+Output files (if output specified):
+- <output_image> (PNG) side-by-side plot
+- <output_image_stem>_ks_scan.csv full KS results
 
-CLI Usage:
-    python returns_analysis.py --input MSTR_Options_cleaned.parquet
-    python returns_analysis.py --input data.csv --output results.png --bins 200
-
-Dependencies:
-    pandas, numpy, scipy, matplotlib, statsmodels, (optional) pyarrow
+Requires: pandas, numpy, scipy, matplotlib, tqdm, KDEpy (for KDE).
 """
-
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, List, Any
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.stats as stats
-from scipy.optimize import minimize
-from KDEpy import FFTKDE
+try:
+    from KDEpy import FFTKDE
+except ImportError:
+    FFTKDE = None
 from tqdm import tqdm
 
+# ----------------------------------------------------------------------------
+# Cleaning utilities
+# ----------------------------------------------------------------------------
 
-# ============================================================================
-# CORE PIPELINE FUNCTIONS
-# ============================================================================
+def coerce_price_column(df: pd.DataFrame, price_col: str = 'Price') -> pd.DataFrame:
+    target = df.copy()
+    if price_col not in target.columns:
+        for alt in ['Price', 'prices_clean', 'Stock Price']:
+            if alt in target.columns:
+                price_col = alt
+                break
+    if price_col not in target.columns:
+        raise KeyError("No price-like column found for cleaning.")
+    raw = target[price_col].astype(str).str.strip()
+    cleaned = (raw
+               .str.replace(r'\(([^)]+)\)', r'-\1', regex=True)
+               .str.replace("'", '', regex=False)
+               .str.replace(',', '', regex=False)
+               .str.replace(r'[\$+]', '', regex=True)
+               .str.replace(r'[^0-9.\-]', '', regex=True))
+    target[price_col] = pd.to_numeric(cleaned, errors='coerce')
+    return target
 
-def calculate_returns(df: pd.DataFrame, group_col: str = 'Symbol', 
-                     price_col: str = 'Stock Price', verbose: bool = True) -> pd.DataFrame:
-    """Calculate returns using lagged stock prices grouped by symbol.
-    
-    Args:
-        df: DataFrame with stock price data
-        group_col: Column to group by (default 'Symbol')
-        price_col: Column containing stock prices
-        verbose: Show progress bar
-    
-    Returns:
-        DataFrame with added columns: 'Stock.Price_Lag1' and 'Returns'
-    """
-    df = df.copy()
-    
+# ----------------------------------------------------------------------------
+# Returns calculation
+# ----------------------------------------------------------------------------
+
+def calculate_returns(df: pd.DataFrame, group_col: str = 'Tic', price_col: str = 'Price', verbose: bool = True) -> pd.DataFrame:
+    out = df.copy()
+    if price_col not in out.columns:
+        raise KeyError(f"Price column '{price_col}' not found.")
+    if group_col not in out.columns:
+        raise KeyError(f"Group column '{group_col}' not found.")
     if verbose:
         with tqdm(total=2, desc="Calculating returns", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
-            df['Stock.Price_Lag1'] = df.groupby(group_col)[price_col].shift(1)
+            out['Price_Lag1'] = out.groupby(group_col)[price_col].shift(1)
             pbar.update(1)
-            df['Returns'] = (df[price_col] - df['Stock.Price_Lag1']) / df['Stock.Price_Lag1']
+            out['Returns'] = (out[price_col] - out['Price_Lag1']) / out['Price_Lag1']
             pbar.update(1)
     else:
-        df['Stock.Price_Lag1'] = df.groupby(group_col)[price_col].shift(1)
-        df['Returns'] = (df[price_col] - df['Stock.Price_Lag1']) / df['Stock.Price_Lag1']
-    
-    return df
+        out['Price_Lag1'] = out.groupby(group_col)[price_col].shift(1)
+        out['Returns'] = (out[price_col] - out['Price_Lag1']) / out['Price_Lag1']
+    return out
 
+# ----------------------------------------------------------------------------
+# Distribution scanning
+# ----------------------------------------------------------------------------
 
-def _get_ticker(df: pd.DataFrame) -> str:
-    """Helper function to extract ticker symbol from DataFrame if needed."""
-    return df['Symbol'].iloc[0][:4]
+def get_infinite_support_continuous_distributions() -> List[str]:
+    names = []
+    for d in dir(stats):
+        obj = getattr(stats, d)
+        if isinstance(obj, stats.rv_continuous):
+            if obj.a == -np.inf and obj.b == np.inf:
+                names.append(obj.name)
+    return names
 
+def find_dist(dist_list: List[str], sample: np.ndarray, alpha: float = 0.01) -> pd.DataFrame:
+    rows = []
+    for dist_name in dist_list:
+        dist = getattr(stats, dist_name)
+        try:
+            params = dist.fit(sample)
+            ks_stat, ks_p = stats.kstest(sample, dist_name, args=params)
+            rows.append({
+                'distribution': dist_name,
+                'D_stat': ks_stat,
+                'p_value': ks_p,
+                'decision_alpha': 'Fail to reject' if ks_p > alpha else 'Reject',
+                'alpha': alpha,
+                'parameters': params
+            })
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame(columns=['distribution','D_stat','p_value','decision_alpha','alpha','parameters'])
+    return pd.DataFrame(rows).sort_values(by='p_value', ascending=False).reset_index(drop=True)
 
+# ----------------------------------------------------------------------------
+# KDE fitting
+# ----------------------------------------------------------------------------
 
-def parametric_fit(data: pd.Series | np.ndarray, verbose: bool = True) -> dict:
-    """Fit non-central t-distribution to data.
-    
-    The non-central t-distribution models both heavy tails (df) 
-    and skewness (nc parameter).
-    
-    Args:
-        data: Input data for fitting
-        verbose: Show progress bar
-    
-    Returns:
-        Dictionary with fitted parameters: df, nc, loc, scale
-    """
-    if verbose:
-        pbar = tqdm(total=100, desc="Fitting NCT distribution", 
-                   bar_format='{l_bar}{bar}| {n_fmt}%')
-        
-        # Custom optimizer that updates progress bar
-        def optimizer_with_progress(func, x0, args=(), disp=0):
-            iteration_count = {'count': 0}
-            
-            def callback(xk):
-                iteration_count['count'] += 1
-                # Update progress bar (estimate ~100 iterations max)
-                progress = min(iteration_count['count'], 100)
-                pbar.n = progress
-                pbar.refresh()
-            
-            result = minimize(func, x0, args=args, method='Nelder-Mead',
-                            callback=callback,
-                            options={'disp': disp, 'maxiter': 1000})
-            
-            if result.success:
-                pbar.n = 100
-                pbar.refresh()
-                pbar.close()
-                return result.x
-            else:
-                pbar.close()
-                raise RuntimeError('NCT optimization failed')
-        
-        params = stats.nct.fit(data, optimizer=optimizer_with_progress)
-    else:
-        params = stats.nct.fit(data)
-    
-    df_est, nc_est, loc_est, scale_est = params
-    
-    return {
-        'df': df_est,
-        'nc': nc_est,
-        'loc': loc_est,
-        'scale': scale_est,
-        'params': params
-    }
-
-
-def nonparametric_fit(data: pd.Series | np.ndarray, bw: str = 'ISJ', verbose: bool = True) -> FFTKDE:
-    """Fit Kernel Density Estimator using FFT method.
-    
-    Args:
-        data: Input data for KDE
-        bw: Bandwidth selection method (default 'ISJ')
-        verbose: Show progress bar
-    
-    Returns:
-        Fitted FFTKDE object 
-    """
+def fit_kde(data: np.ndarray, bw: str = 'ISJ', verbose: bool = True) -> Any:
+    if FFTKDE is None:
+        raise ImportError("KDEpy not installed. Install with: pip install KDEpy")
     if verbose:
         with tqdm(total=1, desc="Fitting KDE", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
-            kde = FFTKDE(kernel='gaussian', bw=bw).fit(data.to_numpy().reshape(-1, 1))
+            kde = FFTKDE(kernel='gaussian', bw=bw).fit(data.reshape(-1, 1))
             pbar.update(1)
     else:
-        kde = FFTKDE(kernel='gaussian', bw=bw).fit(data.to_numpy().reshape(-1, 1))
-    
-    return kde 
+        kde = FFTKDE(kernel='gaussian', bw=bw).fit(data.reshape(-1, 1))
+    return kde
 
+# ----------------------------------------------------------------------------
+# Plotting
+# ----------------------------------------------------------------------------
 
-
-def plot_side_by_side_fits(df: pd.DataFrame, data: pd.Series | np.ndarray, nct_params: dict, 
-                           kde: FFTKDE, 
-                           output_path: str = None, 
-                           figsize: tuple = (16, 6)) -> None:
-    """Plot parametric and non-parametric fits in side-by-side subplots.
-    
-    Args:
-        data: Returns data
-        nct_params: Non-central t distribution parameters from parametric_fit()
-        kde: Fitted KDE object from nonparametric_fit()
-        bins: Number of histogram bins
-        output_path: If provided, save figure to this path instead of showing
-        figsize: Figure size as (width, height) tuple
-    """
+def plot_side_by_side(data: np.ndarray, dist_name: str, params: tuple, kde: Any, ticker: str, output_path: Optional[str]) -> None:
     x = np.linspace(np.min(data), np.max(data), 500)
-    pdf_values = stats.nct.pdf(x, nct_params['df'], nct_params['nc'], 
-                               nct_params['loc'], nct_params['scale'])
-    
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
-    
-    # Left plot: Parametric (NCT)
-    bins = int(2 * (len(data) ** (1/3))) 
-    ax1.hist(data, bins=bins, density=True, alpha=0.6, color='steelblue', label='Data Histogram')
-    ax1.plot(x, pdf_values, 'r--', lw=2.5,
-             label=f"NCT Fit (df={nct_params['df']:.1f}, nc={nct_params['nc']:.2f})")
-    ax1.set_title('Parametric Fit: Non-Central t-Distribution', fontsize=12, fontweight='bold')
-    ax1.set_xlabel('Returns')
-    ax1.set_ylabel('Density')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # Right plot: Non-parametric (KDE)
-    kde_support, kde_density = kde.evaluate()
-    ax2.hist(data, bins=bins, density=True, alpha=0.6, color='steelblue', label='Data Histogram')
-    ax2.plot(kde_support, kde_density, lw=2.5, color='darkgreen', label='KDE Fit')
-    ax2.set_title('Non-Parametric Fit: Kernel Density Estimation', fontsize=12, fontweight='bold')
-    ax2.set_xlabel('Returns')
-    ax2.set_ylabel('Density')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    plt.suptitle(f'{_get_ticker(df)} Returns Distribution Fitting ({len(data):,} observations)', 
-                 fontsize=14, fontweight='bold', y=1.02)
+    dist = getattr(stats, dist_name)
+    pdf_vals = dist.pdf(x, *params)
+    bins = 'fd'
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    # Parametric
+    ax1.hist(data, bins=bins, density=True, alpha=0.6, color='steelblue', label='Histogram')
+    ax1.plot(x, pdf_vals, 'r--', lw=2, label=f"{dist_name} PDF")
+    ax1.set_title(f'Best Parametric: {dist_name}')
+    ax1.set_xlabel('Returns'); ax1.set_ylabel('Density'); ax1.legend(); ax1.grid(True, alpha=0.3)
+    # KDE
+    support, density = kde.evaluate()
+    ax2.hist(data, bins=bins, density=True, alpha=0.6, color='steelblue', label='Histogram')
+    ax2.plot(support, density, lw=2, color='darkgreen', label='KDE')
+    ax2.set_title('Non-Parametric: KDE')
+    ax2.set_xlabel('Returns'); ax2.set_ylabel('Density'); ax2.legend(); ax2.grid(True, alpha=0.3)
+    plt.suptitle(f'{ticker} Returns Fit ({len(data):,} observations)', fontsize=14, fontweight='bold', y=1.02)
     plt.tight_layout()
-    
     if output_path:
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        print(f"Figure saved to: {output_path}")
+        print(f"Saved plot: {output_path}")
     else:
         plt.show()
-    
     plt.close(fig)
 
+# ----------------------------------------------------------------------------
+# Main analysis function
+# ----------------------------------------------------------------------------
 
-# ============================================================================
-# MAIN PIPELINE FUNCTION
-# ============================================================================
+def analyze_returns(df: pd.DataFrame,
+                    output_path: Optional[str] = None,
+                    kde_bw: str = 'ISJ',
+                    group_col: str = 'Tic',
+                    price_col: str = 'Price',
+                    ticker: Optional[str] = None,
+                    start_date: Optional[str] = None,
+                    end_date: Optional[str] = None,
+                    date_col: str = 'Date',
+                    distributions: Optional[List[str]] = None,
+                    alpha: float = 0.01,
+                    verbose: bool = True) -> dict:
+    if verbose:
+        print(f"Starting with {len(df):,} rows")
 
-def analyze_returns_and_plot(df: pd.DataFrame, 
-                            output_path: str = None,
-                            kde_bw: str = 'ISJ',
-                            group_col: str = 'Symbol',
-                            price_col: str = 'Stock Price',
-                            verbose: bool = True) -> dict:
-    """Complete pipeline: calculate returns, fit models, and generate side-by-side plots.
-    
-    Args:
-        df: Input DataFrame with stock price data
-        output_path: Path to save figure (if None, displays plot)
-        bins: Number of histogram bins
-        kde_bw: KDE bandwidth method (default 'ISJ')
-        group_col: Column to group by for returns calculation
-        price_col: Price column name
-        verbose: Print progress information
-    
-    Returns:
-        Dictionary with returns series, NCT params, and KDE fit
-    """
-    if verbose:
-        print(f"Starting analysis on DataFrame with {len(df):,} rows...")
-    
-    # Step 1: Calculate returns
-    if verbose:
-        print("Step 1: Calculating returns...")
+    # 1. Clean prices
+    df = coerce_price_column(df, price_col)
+
+    # Ticker filter
+    if ticker:
+        before = len(df)
+        df = df[df[group_col] == ticker].copy()
+        if verbose:
+            print(f"Ticker filter {ticker}: {before:,} -> {len(df):,}")
+
+    # Date filtering
+    if date_col in df.columns and (start_date or end_date):
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce', format='mixed')
+        before = len(df)
+        if start_date:
+            df = df[df[date_col] >= pd.to_datetime(start_date)]
+        if end_date:
+            df = df[df[date_col] <= pd.to_datetime(end_date)]
+        if verbose:
+            print(f"Date filter: {before:,} -> {len(df):,}")
+
+    # 2. Calculate returns
+    if verbose: print("Calculating returns...")
     df = calculate_returns(df, group_col=group_col, price_col=price_col, verbose=verbose)
-    
-    # Step 2: Drop missing values
+    before = len(df)
+    df = df.dropna(subset=['Price_Lag1', 'Returns'])
     if verbose:
-        print("Step 2: Dropping missing values...")
-    original_len = len(df)
-    df = df.dropna(subset=['Stock.Price_Lag1', 'Returns'])
+        dropped = before - len(df)
+        print(f"Dropped {dropped:,} rows with NaNs in returns ({dropped/before*100:.2f}%)")
+
+    returns = df['Returns'].to_numpy()
+
+    # 3. Fit KDE
+    if verbose: print(f"Fitting KDE (bw={kde_bw})...")
+    kde = fit_kde(returns, bw=kde_bw, verbose=verbose)
     if verbose:
-        print(f"  Dropped {original_len - len(df):,} rows ({(original_len - len(df))/original_len*100:.2f}%)")
-        print(f"  Remaining: {len(df):,} observations")
-    
-    returns = df['Returns']
-    
-    # Step 3: Fit parametric model (Non-Central t)
-    if verbose:
-        print("Step 3: Fitting parametric model (Non-Central t-distribution)...")
-    nct_params = parametric_fit(returns, verbose=verbose)
-    if verbose:
-        print(f"\n  Parametric Fit Parameters:")
-        print(f"  {'='*60}")
-        print(f"  Degrees of Freedom (df): {nct_params['df']:.4f}")
-        print(f"  Non-centrality (nc):     {nct_params['nc']:.4f}")
-        print(f"  Location (loc):          {nct_params['loc']:.6f}")
-        print(f"  Scale:                   {nct_params['scale']:.6f}")
-        print(f"  {'='*60}\n")
-    
-    # Step 4: Fit non-parametric model (KDE)
-    if verbose:
-        print(f"Step 4: Fitting non-parametric model (KDE with {kde_bw} bandwidth)...")
-    kde = nonparametric_fit(returns, bw=kde_bw, verbose=verbose)
-    kde_support, kde_density = kde.evaluate()   
-    if verbose:
-        print(f"\n  Non-Parametric Fit Parameters:")
-        print(f"  {'='*60}")
-        print(f"  Bandwidth method:        {kde_bw}")
-        print(f"  Bandwidth value:         {kde.bw:.6f}")
-        print(f"  Support points:          {len(kde_support)}")
-        print(f"  Support range:           [{kde_support.min():.6f}, {kde_support.max():.6f}]")
-        print(f"  {'='*60}\n")
-    
-    # Step 5: Generate side-by-side plots
-    if verbose:
-        print("Step 5: Generating side-by-side comparison plots...")
-        with tqdm(total=1, desc="Generating plots", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
-            plot_side_by_side_fits(df, returns, nct_params, kde, 
-                                   output_path=output_path)
-            pbar.update(1)
+        print(f"KDE bandwidth: {kde.bw:.6f}")
+
+    # 4. Determine distributions list
+    if distributions is None:
+        distributions = get_infinite_support_continuous_distributions()
+        if verbose:
+            print(f"Scanning {len(distributions)} infinite-support continuous distributions")
     else:
-        plot_side_by_side_fits(df, returns, nct_params, kde, 
-                               output_path=output_path)
+        if verbose:
+            print(f"Scanning user-specified {len(distributions)} distributions")
+
+    # 5. KS scan (parametric distributions)
+    if verbose: print("Running KS scan...")
+    ks_df = find_dist(distributions, returns, alpha=alpha)
+    if ks_df.empty:
+        raise RuntimeError("No distributions successfully fitted.")
     
+    # 5b. KS test for KDE (using empirical CDF)
+    if verbose: print("KS test for KDE...")
+    def kde_cdf(x):
+        support, density = kde.evaluate()
+        # Integrate density up to x using cumulative sum
+        dx = np.diff(support)
+        cumulative = np.cumsum(density[:-1] * dx)
+        cumulative = np.concatenate([[0], cumulative])
+        return np.interp(x, support, cumulative)
+    
+    ks_kde_stat, ks_kde_p = stats.kstest(returns, kde_cdf)
+    kde_row = pd.DataFrame([{
+        'distribution': 'KDE',
+        'D_stat': ks_kde_stat,
+        'p_value': ks_kde_p,
+        'decision_alpha': 'Fail to reject' if ks_kde_p > alpha else 'Reject',
+        'alpha': alpha,
+        'parameters': f'bw={kde.bw:.6f}'
+    }])
+    
+    # Concatenate and re-sort by p_value
+    ks_df = pd.concat([ks_df, kde_row], ignore_index=True)
+    ks_df = ks_df.sort_values(by='p_value', ascending=False).reset_index(drop=True)
+    
+    # Identify best distribution (highest p-value)
+    best = ks_df.iloc[0]
+    best_dist = best['distribution']
+    best_params = best['parameters'] if best_dist != 'KDE' else None
     if verbose:
-        print("\nAnalysis complete!")
+        print("Best fit distribution:")
+        print(best)
+
+    # 6. Plot
+    if not output_path and ticker:
+        output_path = f"{ticker}_returns_fit.png"
     
+    # Only plot if best is not KDE (parametric distribution)
+    if best_dist != 'KDE':
+        plot_side_by_side(returns, best_dist, tuple(best_params), kde, ticker or 'TICKER', output_path)
+    else:
+        if verbose:
+            print(f"Best fit is KDE (non-parametric), skipping parametric vs KDE plot.")
+
+    # 7. Persist KS scan
+    if output_path:
+        scan_path = Path(output_path).with_suffix('').as_posix() + '_ks_scan.csv'
+        ks_df.to_csv(scan_path, index=False)
+        if verbose:
+            print(f"Saved KS scan: {scan_path}")
+
     return {
         'returns': returns,
-        'nct_params': nct_params,
-        'kde': kde
+        'kde': kde,
+        'ks_scan': ks_df,
+        'best_distribution': best_dist,
+        'best_params': best_params
     }
 
+# ----------------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------------
 
-# ============================================================================
-# REMOVED/SIMPLIFIED SECTIONS
-# ============================================================================
-# The following functions are kept for backward compatibility but not used in main pipeline
+def load_config(path: str) -> dict:
+    with open(path, 'r') as f:
+        return json.load(f)
 
-def plot_kde_overlay(data: pd.Series | np.ndarray, kde: FFTKDE, bins: int = 150) -> None:
-    """Plot histogram with KDE overlay (non-parametric fit)."""
-    plt.figure(figsize=(10, 6))
-    plt.hist(data, bins=bins, density=True, alpha=0.5, color='steelblue', label='Data Histogram')
-    plt.plot(kde.support, kde.density, lw=2, color='darkgreen', label='FFT-KDE')
-    plt.title(f'Non-Parametric Fit: KDE on {len(data):,} points')
-    plt.xlabel('Returns')
-    plt.ylabel('Density')
-    plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.show()
-
-
-def plot_nct_overlay(data: pd.Series | np.ndarray, nct_params: dict, bins: int = 150) -> None:
-    """Plot histogram with fitted non-central t distribution overlay (parametric fit)."""
-    x = np.linspace(np.min(data), np.max(data), 500)
-    pdf_values = stats.nct.pdf(x, nct_params['df'], nct_params['nc'], 
-                               nct_params['loc'], nct_params['scale'])
-    
-    plt.figure(figsize=(10, 6))
-    plt.hist(data, bins=bins, density=True, alpha=0.6, color='steelblue', label='Data Histogram')
-    plt.plot(x, pdf_values, 'r--', lw=2,
-             label=f"Skew-t (nct) Fit\n(df={nct_params['df']:.1f}, skew={nct_params['nc']:.1f})")
-    plt.title('Parametric Fit: Non-Central t-Distribution')
-    plt.xlabel('Returns')
-    plt.ylabel('Density')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.show()
-
-
-def plot_combined_fit(data: pd.Series | np.ndarray, nct_params: dict, 
-                     kde: FFTKDE, 
-                     bins: int = 150) -> None:
-    """Plot histogram with both parametric (NCT) and non-parametric (KDE) overlays."""
-    x = np.linspace(np.min(data), np.max(data), 500)
-    pdf_values = stats.nct.pdf(x, nct_params['df'], nct_params['nc'], 
-                               nct_params['loc'], nct_params['scale'])
-    kde_support, kde_density = kde.evaluate()   
-    plt.figure(figsize=(12, 7))
-    plt.hist(data, bins=bins, density=True, alpha=0.5, color='steelblue', label='Data Histogram')
-    plt.plot(x, pdf_values, 'r--', lw=2.5,
-             label=f"Parametric: NCT (df={nct_params['df']:.1f}, nc={nct_params['nc']:.2f})")
-    plt.plot(kde_support, kde_density, lw=2.5, color='darkgreen', label='Non-Parametric: KDE')
-    plt.title(f'{_get_ticker(data)} Returns Distribution Fits ({len(data):,} observations)')
-    plt.xlabel('Returns')
-    plt.ylabel('Density')
-    plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.show()
-
-
-# ============================================================================
-# CLI / MAIN
-# ============================================================================
-
-def load_config(config_path: str) -> dict:
-    """Load configuration from JSON file.
-    
-    Args:
-        config_path: Path to JSON config file
-    
-    Returns:
-        Dictionary with configuration parameters
-    """
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    return config
-
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Returns distribution fitting (KDE + best parametric)")
+    p.add_argument('--config', '-c', help='Path to JSON config file')
+    p.add_argument('--input', '-i', help='Path to CSV/Parquet data')
+    p.add_argument('--output', '-o', help='Output image path (PNG)')
+    p.add_argument('--kde-bw', default='ISJ', help='KDE bandwidth method (default ISJ)')
+    p.add_argument('--group-col', default='Tic', help='Ticker column (default Tic)')
+    p.add_argument('--price-col', default='Price', help='Price column (default Price)')
+    p.add_argument('--ticker', help='Ticker symbol filter')
+    p.add_argument('--start-date', help='Start date YYYY-MM-DD')
+    p.add_argument('--end-date', help='End date YYYY-MM-DD')
+    p.add_argument('--date-col', default='Date', help='Date column name (default Date)')
+    p.add_argument('--distributions', help='Comma separated list of distributions to test')
+    p.add_argument('--alpha', type=float, default=0.01, help='Alpha for KS test decisions (default 0.01)')
+    p.add_argument('--quiet', '-q', action='store_true', help='Suppress verbose output')
+    return p.parse_args()
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Analyze options returns: calculate returns, fit KDE and NCT, output side-by-side plots.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Config File Format (JSON):
-{
-    "input": "path/to/data.parquet",
-    "output": "path/to/output.png",
-    "bins": 150,
-    "kde_bw": "silverman",
-    "group_col": "Symbol",
-    "price_col": "Stock Price",
-    "quiet": false
-}
+    args = parse_args()
+    config = load_config(args.config) if args.config else {}
 
-Example:
-  python returns_analysis.py --config config.json
-  python returns_analysis.py --input data.parquet --output plot.png
-        """
-    )
-    parser.add_argument('--config', '-c', help='Path to JSON configuration file')
-    parser.add_argument('--input', '-i', help='Path to cleaned parquet/csv file')
-    parser.add_argument('--output', '-o', help='Output path for side-by-side plot image', default=None)
-    parser.add_argument('--bins', type=int, default=150, help='Number of histogram bins (default: 150)')
-    parser.add_argument('--kde-bw', default='silverman', help='KDE bandwidth method (default: silverman)')
-    parser.add_argument('--group-col', default='Symbol', help='Column for grouping (default: Symbol)')
-    parser.add_argument('--price-col', default='Stock Price', help='Price column (default: Stock Price)')
-    parser.add_argument('--quiet', '-q', action='store_true', help='Suppress progress output')
-    
-    args = parser.parse_args()
-    
-    # Load config file if provided and merge with command-line args (CLI takes precedence)
-    config = {}
-    if args.config:
-        config = load_config(args.config)
-        print(f"Loaded configuration from: {args.config}\n")
-    
-    # Merge config with args (command-line arguments override config file)
-    input_path = args.input if args.input else config.get('input')
-    output_path = args.output if args.output else config.get('output')
-    bins = args.bins if args.bins != 150 else config.get('bins', 150)
-    kde_bw = args.kde_bw if args.kde_bw != 'silverman' else config.get('kde_bw', 'silverman')
-    group_col = args.group_col if args.group_col != 'Symbol' else config.get('group_col', 'Symbol')
-    price_col = args.price_col if args.price_col != 'Stock Price' else config.get('price_col', 'Stock Price')
+    # Merge precedence: CLI overrides config
+    input_path = args.input or config.get('input')
+    output_path = args.output or config.get('output')
+    kde_bw = args.kde_bw if args.kde_bw != 'ISJ' else config.get('kde_bw', 'ISJ')
+    group_col = args.group_col if args.group_col != 'Tic' else config.get('group_col', 'Tic')
+    price_col = args.price_col if args.price_col != 'Price' else config.get('price_col', 'Price')
+    ticker = args.ticker or config.get('ticker')
+    start_date = args.start_date or config.get('start_date')
+    end_date = args.end_date or config.get('end_date')
+    date_col = args.date_col if args.date_col != 'Date' else config.get('date_col', 'Date')
+    alpha = args.alpha if args.alpha != 0.01 else config.get('alpha', 0.01)
     quiet = args.quiet or config.get('quiet', False)
-    
-    # Load data
-    if input_path:
-        if input_path.endswith('.parquet'):
-            df = pd.read_parquet(input_path)
+    distributions_arg = args.distributions or config.get('distributions')
+    distributions = None
+    if distributions_arg:
+        if isinstance(distributions_arg, list):
+            distributions = distributions_arg
         else:
-            df = pd.read_csv(input_path)
-        if not quiet:
-            print(f"Loaded {input_path}: {len(df):,} rows\n")
-    else:
-        print("Error: No input data file specified. Use --input or provide in config file.")
-        return
-    
-    # Run complete pipeline
-    results = analyze_returns_and_plot(
-        df=df,
-        output_path=output_path,
-        kde_bw=kde_bw,
-        group_col=group_col,
-        price_col=price_col,
-        verbose=not quiet
-    )
-    
-    if not quiet:
-        print(f"\nReturns statistics:")
-        print(results['returns'].describe())
+            distributions = [d.strip() for d in distributions_arg.split(',') if d.strip()]
 
+    if not input_path:
+        print('Error: input path required (use --input or config file).')
+        return
+
+    # Load data
+    if input_path.endswith('.parquet'):
+        df = pd.read_parquet(input_path)
+    else:
+        df = pd.read_csv(input_path)
+    if not quiet:
+        print(f"Loaded {input_path}: {len(df):,} rows")
+
+    results = analyze_returns(df=df,
+                              output_path=output_path,
+                              kde_bw=kde_bw,
+                              group_col=group_col,
+                              price_col=price_col,
+                              ticker=ticker,
+                              start_date=start_date,
+                              end_date=end_date,
+                              date_col=date_col,
+                              distributions=distributions,
+                              alpha=alpha,
+                              verbose=not quiet)
+
+    if not quiet:
+        print('\nReturns summary:')
+        print(pd.Series(results['returns']).describe())
+        print('\nBest distribution:')
+        print(results['best_distribution'])
+        print('Parameters:', results['best_params'])
+        print('\nTop KS scan head:')
+        print(results['ks_scan'].head())
 
 if __name__ == '__main__':
     main()

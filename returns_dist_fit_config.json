@@ -1,9 +1,14 @@
 {
-  "input": "TSLA_Options_cleaned.parquet",
-  "output": "TSLA_returns_distribution_fits.png",
-  "bins": 150,
+  "input": "C:\\Users\\Saber\\Desktop\\research\\Dropbox\\SwIRL_GPU\\Stock Market Research\\Data_Source\\master_stock.csv",
+  "output": null,
   "kde_bw": "ISJ",
-  "group_col": "Symbol",
-  "price_col": "Stock Price",
+  "ticker": "NVDA",
+  "start_date": null,
+  "end_date": null,
+  "date_col": "Date",
+  "group_col": "Tic",
+  "price_col": "Price",
+  "alpha": 0.01,
+  "distributions": ["cauchy", "skewcauchy", "norm", "skewnorm", "t", "nct", "laplace", "gamma", "lognorm", "gennorm"],
   "quiet": false
 }
