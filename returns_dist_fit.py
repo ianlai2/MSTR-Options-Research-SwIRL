@@ -49,6 +49,40 @@ from tqdm import tqdm
 # ----------------------------------------------------------------------------
 
 def coerce_price_column(df: pd.DataFrame, price_col: str = 'Price') -> pd.DataFrame:
+    """Coerce a raw price column containing messy string representations into numeric floats.
+
+    This function attempts to locate a usable price column, applying a series of
+    regex‐based normalizations (handling parentheses for negatives, removing
+    commas, currency symbols, stray quotes and any non numeric characters) and
+    then converts the cleaned strings to numeric values.
+
+    If the provided `price_col` is not present, several common fallbacks are
+    searched. The original DataFrame is never modified in place.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Source data containing at least one price column candidate.
+    price_col : str, default 'Price'
+        Preferred price column name. Fallbacks are tried if absent.
+
+    Returns
+    -------
+    pd.DataFrame
+        A copy of the input DataFrame with the resolved price column coerced
+        to numeric (invalid parses become NaN).
+
+    Raises
+    ------
+    KeyError
+        If no suitable price column can be found.
+
+    Notes
+    -----
+    The cleaning intentionally strips anything not part of a standard float
+    representation (digits, period, minus sign). Parenthetical negatives are
+    converted ("(123.4)" -> "-123.4").
+    """
     target = df.copy()
     if price_col not in target.columns:
         for alt in ['Price', 'prices_clean', 'Stock Price']:
@@ -72,6 +106,34 @@ def coerce_price_column(df: pd.DataFrame, price_col: str = 'Price') -> pd.DataFr
 # ----------------------------------------------------------------------------
 
 def calculate_returns(df: pd.DataFrame, group_col: str = 'Tic', price_col: str = 'Price', verbose: bool = True) -> pd.DataFrame:
+    """Calculate simple returns for each group (ticker) and append columns.
+
+    Adds two columns:
+    - `Price_Lag1`: Previous price within each group.
+    - `Returns`: (Price - Price_Lag1) / Price_Lag1.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input price time series with at least group and price columns.
+    group_col : str, default 'Tic'
+        Column identifying securities/instruments (grouping key).
+    price_col : str, default 'Price'
+        Column containing numeric prices.
+    verbose : bool, default True
+        If True, shows a tqdm progress bar for the two operations.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of input with `Price_Lag1` and `Returns` appended (may contain
+        NaNs for the first observation per group).
+
+    Raises
+    ------
+    KeyError
+        If either the group or price column is missing.
+    """
     out = df.copy()
     if price_col not in out.columns:
         raise KeyError(f"Price column '{price_col}' not found.")
@@ -93,6 +155,21 @@ def calculate_returns(df: pd.DataFrame, group_col: str = 'Tic', price_col: str =
 # ----------------------------------------------------------------------------
 
 def get_infinite_support_continuous_distributions() -> List[str]:
+    """Enumerate SciPy continuous distributions with infinite real support.
+
+    Searches the ``scipy.stats`` namespace for instances of ``rv_continuous``
+    whose lower bound ``a`` is ``-inf`` and upper bound ``b`` is ``inf``.
+
+    Returns
+    -------
+    list of str
+        Distribution names suitable for fitting to unbounded real data.
+
+    Notes
+    -----
+    This intentionally excludes bounded, semi-bounded and discrete
+    distributions. The list can vary between SciPy versions.
+    """
     names = []
     for d in dir(stats):
         obj = getattr(stats, d)
@@ -102,6 +179,35 @@ def get_infinite_support_continuous_distributions() -> List[str]:
     return names
 
 def find_dist(dist_list: List[str], sample: np.ndarray, alpha: float = 0.01) -> pd.DataFrame:
+    """Fit and KS-test a collection of distributions against a sample.
+
+    For each distribution name provided, ``scipy.stats`` is used to ``fit``
+    parameters via MLE, then a one-sample Kolmogorov–Smirnov test is applied.
+    Results are collected, sorted by descending p-value and returned.
+
+    Parameters
+    ----------
+    dist_list : list of str
+        Distribution names accessible as ``getattr(stats, name)``.
+    sample : np.ndarray
+        1D array of sample observations.
+    alpha : float, default 0.01
+        Significance level used to derive the textual decision column.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ``distribution``, ``D_stat``, ``p_value``, ``decision_alpha``,
+        ``alpha``, ``parameters``. Sorted by ``p_value`` descending. May be
+        empty if all fits fail.
+
+    Notes
+    -----
+    - Exceptions during fitting or testing are swallowed (row skipped).
+    - Parameter tuples follow SciPy's (shape..., loc, scale) convention.
+    - Use caution interpreting p-values with large samples (may reject slight
+      deviations).
+    """
     rows = []
     for dist_name in dist_list:
         dist = getattr(stats, dist_name)
@@ -127,6 +233,27 @@ def find_dist(dist_list: List[str], sample: np.ndarray, alpha: float = 0.01) -> 
 # ----------------------------------------------------------------------------
 
 def fit_kde(data: np.ndarray, bw: str = 'ISJ', verbose: bool = True) -> Any:
+    """Fit a Gaussian FFT-based KDE to 1D data using KDEpy.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        1D array of observations.
+    bw : str or float, default 'ISJ'
+        Bandwidth specification passed to ``FFTKDE`` (e.g., 'ISJ', 'silverman').
+    verbose : bool, default True
+        If True, displays a progress bar for the fitting step.
+
+    Returns
+    -------
+    KDEpy.FFTKDE
+        Fitted KDE object. Use ``evaluate()`` to obtain support and density.
+
+    Raises
+    ------
+    ImportError
+        If KDEpy is not installed.
+    """
     if FFTKDE is None:
         raise ImportError("KDEpy not installed. Install with: pip install KDEpy")
     if verbose:
@@ -142,6 +269,35 @@ def fit_kde(data: np.ndarray, bw: str = 'ISJ', verbose: bool = True) -> Any:
 # ----------------------------------------------------------------------------
 
 def plot_side_by_side(data: np.ndarray, dist_name: str, params: tuple, kde: Any, ticker: str, output_path: Optional[str]) -> None:
+    """Generate a side-by-side parametric vs KDE returns distribution plot.
+
+    Left panel: Histogram with overlaid parametric PDF for the best fitted
+    distribution. Right panel: Histogram with overlaid KDE density curve.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        1D returns series.
+    dist_name : str
+        Name of best parametric distribution.
+    params : tuple
+        Fitted parameter tuple for the distribution (shape..., loc, scale).
+    kde : Any
+        Fitted KDE object supporting ``evaluate()``.
+    ticker : str
+        Label used in the plot title.
+    output_path : str or None
+        If provided, path to save PNG (created/overwritten). If None, shows plot.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Uses Freedman–Diaconis rule ('fd') for histogram bin sizing. Figure is
+    closed after saving/showing to avoid memory accumulation in batch runs.
+    """
     x = np.linspace(np.min(data), np.max(data), 500)
     dist = getattr(stats, dist_name)
     pdf_vals = dist.pdf(x, *params)
@@ -183,6 +339,64 @@ def analyze_returns(df: pd.DataFrame,
                     distributions: Optional[List[str]] = None,
                     alpha: float = 0.01,
                     verbose: bool = True) -> dict:
+    """End-to-end returns analysis pipeline producing fits, plot and summary.
+
+    Steps:
+    1. Clean price column.
+    2. Optional ticker/date filtering.
+    3. Compute lagged prices and simple returns; drop NaNs.
+    4. Fit KDE to returns.
+    5. Determine parametric distribution list (all infinite support if not provided).
+    6. KS scan for each parametric distribution.
+    7. Perform KS test for KDE via empirical CDF integration.
+    8. Rank all (parametric + KDE) by p-value, choose best.
+    9. Plot parametric vs KDE (if best is parametric) and persist KS scan CSV.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataset containing at least price, group, and optional date columns.
+    output_path : str, optional
+        Path for output plot. If None and `ticker` provided, auto-names ``<ticker>_returns_fit.png``.
+    kde_bw : str, default 'ISJ'
+        Bandwidth specification for FFTKDE.
+    group_col : str, default 'Tic'
+        Column identifying instrument/group for lagged return calculation.
+    price_col : str, default 'Price'
+        Column holding prices to clean and use for returns.
+    ticker : str, optional
+        If set, filters DataFrame to matching group before analysis.
+    start_date, end_date : str, optional
+        ISO date strings delimiting inclusive date filter on `date_col`.
+    date_col : str, default 'Date'
+        Date column name (parsed to datetime if filtering applied).
+    distributions : list of str, optional
+        User-specified distribution names to scan. If None, all infinite support continuous.
+    alpha : float, default 0.01
+        Significance threshold for KS decision labeling.
+    verbose : bool, default True
+        If True, prints progress messages.
+
+    Returns
+    -------
+    dict
+        Keys:
+        - ``returns``: 1D numpy array of cleaned returns.
+        - ``kde``: fitted KDE object.
+        - ``ks_scan``: DataFrame of KS results including KDE row.
+        - ``best_distribution``: name of highest p-value entry.
+        - ``best_params``: parameter tuple (None if best is KDE).
+
+    Raises
+    ------
+    RuntimeError
+        If no parametric distributions fit successfully.
+
+    Notes
+    -----
+    KDE KS test constructs an empirical CDF by cumulative trapezoid-like
+    integration over evaluated support. Plot skipped when KDE is top performer.
+    """
     if verbose:
         print(f"Starting with {len(df):,} rows")
 
@@ -302,10 +516,29 @@ def analyze_returns(df: pd.DataFrame,
 # ----------------------------------------------------------------------------
 
 def load_config(path: str) -> dict:
+    """Load a JSON configuration file.
+
+    Parameters
+    ----------
+    path : str
+        Path to JSON file.
+
+    Returns
+    -------
+    dict
+        Parsed JSON content.
+    """
     with open(path, 'r') as f:
         return json.load(f)
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for returns distribution fitting script.
+
+    Returns
+    -------
+    argparse.Namespace
+        Namespace containing all parsed CLI parameters.
+    """
     p = argparse.ArgumentParser(description="Returns distribution fitting (KDE + best parametric)")
     p.add_argument('--config', '-c', help='Path to JSON config file')
     p.add_argument('--input', '-i', help='Path to CSV/Parquet data')
@@ -323,6 +556,11 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 def main() -> None:
+    """CLI entry point.
+
+    Merges configuration file values with CLI overrides, loads data, executes
+    the analysis pipeline, and prints summary statistics and top KS scan rows.
+    """
     args = parse_args()
     config = load_config(args.config) if args.config else {}
 
